@@ -1,3 +1,5 @@
 streamlit
+pandas
 requests
-requests-oauthlib
+matplotlib
+plotly
