@@ -9,7 +9,7 @@ import streamlit as st
 # ==============================
 # Config
 # ==============================
-API_KEY = "fS2Bo2mKjlheIeaPztPWts54U08g7upK"  # put your Polygon.io key here
+API_KEY = "GuHtoE7JtmzxOpLU_yL_RQOnF1Leliqw"  # put your Polygon.io key here
 BASE_URL = "https://api.polygon.io/v3/snapshot/options"
 
 
