@@ -1,107 +1,145 @@
 import requests
-from requests_oauthlib import OAuth1
-import datetime
+import pandas as pd
+from datetime import datetime
+import time
+import json
+import os
+import streamlit as st
 
 # ==============================
-# Setup your E*TRADE credentials
+# Config
 # ==============================
-CONSUMER_KEY = "YOUR_CONSUMER_KEY"
-CONSUMER_SECRET = "YOUR_CONSUMER_SECRET"
-OAUTH_TOKEN = "YOUR_OAUTH_TOKEN"
-OAUTH_TOKEN_SECRET = "YOUR_OAUTH_TOKEN_SECRET"
-
-# Sandbox URL (use live API endpoint once ready)
-BASE_URL = "https://api.etrade.com/v1/market"
-
-# Auth object
-auth = OAuth1(CONSUMER_KEY,
-              client_secret=CONSUMER_SECRET,
-              resource_owner_key=OAUTH_TOKEN,
-              resource_owner_secret=OAUTH_TOKEN_SECRET)
+API_KEY = "WXuRfmS31yugy8TcIks2AJ77l78tbzVF"  # put your Polygon.io key here
+BASE_URL = "https://api.polygon.io/v3/snapshot/options"
 
 
-def get_option_chain(symbol: str):
-    """Retrieve the option chain for a given symbol from E*TRADE API"""
-    url = f"{BASE_URL}/optionchains.json"
-    params = {
-        "symbol": symbol,
-        "chainType": "CALLPUT",  # both calls and puts
-        "includeGreeks": "true"
-    }
+# ==============================
+# Data Processing
+# ==============================
+def _process_results(data):
+    """Convert raw option results into a DataFrame."""
+    processed = []
+    for item in data:
+        det = item.get("details", {})
+        greeks = item.get("greeks", {})
+        exp_str = det.get("expiration_date")
 
-    response = requests.get(url, auth=auth, params=params)
-    response.raise_for_status()
-    return response.json()
+        # expiration date
+        expiration = None
+        if exp_str:
+            try:
+                expiration = pd.to_datetime(exp_str).date()
+            except Exception:
+                expiration = None
+
+        processed.append({
+            "ticker": det.get("ticker"),
+            "type": det.get("contract_type"),
+            "expiration": expiration,
+            "strike": det.get("strike_price"),
+            "delta": greeks.get("delta"),
+            "gamma": greeks.get("gamma"),
+            "theta": greeks.get("theta"),
+            "vega": greeks.get("vega"),
+            "iv": item.get("implied_volatility"),
+            "mid": item.get("last_quote", {}).get("midpoint"),
+            "open_interest": item.get("open_interest"),
+            "underlying": item.get("underlying_asset", {}).get("price"),
+        })
+
+    df = pd.DataFrame(processed)
+
+    if not df.empty and "expiration" in df:
+        df["expiration"] = pd.to_datetime(df["expiration"], errors="coerce")
+        today = pd.to_datetime(datetime.today().date())
+        df["dte"] = (df["expiration"] - today).dt.days
+
+    return df
 
 
-def filter_options(data, target_dte: int, target_delta: float):
-    """Filter options closest to target DTE and delta"""
-    today = datetime.datetime.now().date()
+def _load_mock(mock_file="mock_soxl.json"):
+    """Load data from local mock JSON file."""
+    if not os.path.exists(mock_file):
+        st.error(f"⚠ Mock file {mock_file} not found")
+        return pd.DataFrame()
+    with open(mock_file, "r") as f:
+        raw = json.load(f)
+    return _process_results(raw.get("results", []))
 
-    candidates = []
-    if "optionPairs" not in data.get("optionChainResponse", {}):
-        return candidates
 
-    for opt in data["optionChainResponse"]["optionPairs"]:
-        for contract_type in ["call", "put"]:
-            option = opt.get(contract_type)
-            if not option:
+def fetch_chain_with_greeks(symbol, max_retries=3, pause=2, mock_file="mock_soxl.json"):
+    """Fetch option chain snapshot from Polygon.io with greeks, fallback to mock file."""
+    url = f"{BASE_URL}/{symbol}"
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(url, params={"apiKey": API_KEY}, timeout=10)
+            if resp.status_code == 429:
+                wait = pause * attempt
+                st.warning(f"Rate limited on {symbol}, retrying in {wait}s...")
+                time.sleep(wait)
                 continue
+            if resp.status_code in (401, 403):
+                st.error(f"Unauthorized/Forbidden for {symbol}, using mock data…")
+                return _load_mock(mock_file)
 
-            exp_date = datetime.datetime.strptime(option["expiryDate"], "%m/%d/%Y").date()
-            dte = (exp_date - today).days
-            delta = float(option["greeks"]["delta"])
+            resp.raise_for_status()
+            data = resp.json().get("results", [])
+            if not data:
+                st.info(f"No options data for {symbol}")
+                return pd.DataFrame()
 
-            # Store with deviation score
-            candidates.append({
-                "type": contract_type.upper(),
-                "symbol": option["optionSymbol"],
-                "strike": option["strikePrice"],
-                "expDate": option["expiryDate"],
-                "dte": dte,
-                "delta": delta,
-                "theta": option["greeks"]["theta"],
-                "vega": option["greeks"]["vega"],
-                "gamma": option["greeks"]["gamma"],
-                "iv": option["greeks"]["iv"],
-                "score": abs(dte - target_dte) + abs(abs(delta) - target_delta)
-            })
+            return _process_results(data)
 
-    # Sort by best match to target DTE + delta
-    candidates.sort(key=lambda x: x["score"])
-    return candidates
+        except Exception as e:
+            st.error(f"Error fetching {symbol}: {e}")
+            st.info(f"➡ Falling back to mock file {mock_file}")
+            return _load_mock(mock_file)
+
+    return pd.DataFrame()
+
+
+def filter_contracts(df, max_dte=50, delta_min=0.10, delta_max=0.50):
+    """Filter options by DTE and delta safely."""
+    if df.empty:
+        return df
+    df = df.dropna(subset=["delta", "expiration"])
+    return df[
+        (df["dte"] <= max_dte) &
+        (df["delta"].abs() >= delta_min) &
+        (df["delta"].abs() <= delta_max)
+    ]
+
+
+# ==============================
+# Streamlit App
+# ==============================
+@st.cache_data(ttl=300)
+def get_chain(symbol):
+    return fetch_chain_with_greeks(symbol)
 
 
 def main():
-    while True:
-        symbol = input("Enter stock symbol (or 'quit'): ").upper()
-        if symbol == "QUIT":
-            break
-        try:
-            dte = int(input("Enter target DTE (e.g., 45): "))
-            delta = float(input("Enter target delta (e.g., 0.30): "))
+    st.set_page_config(page_title="Options Chain Explorer", layout="wide")
+    st.title("📈 Options Chain Explorer with Greeks")
 
-            print(f"\nFetching option chain for {symbol} ...")
-            chain_data = get_option_chain(symbol)
+    symbols = st.multiselect("Choose symbols:", ["SOXL", "SPY", "QQQ", "AAPL"], default=["SOXL"])
 
-            options = filter_options(chain_data, dte, delta)
+    max_dte = st.slider("Max Days to Expiry (DTE)", 5, 90, 50)
+    delta_range = st.slider("Delta Range", 0.0, 1.0, (0.1, 0.5))
 
-            if not options:
-                print("No options found.\n")
-                continue
+    for sym in symbols:
+        st.subheader(f"🔎 {sym}")
+        df = get_chain(sym)
+        if df.empty:
+            st.warning(f"No data returned for {sym}")
+            continue
 
-            print(f"\nTop matches for {symbol} (DTE≈{dte}, Δ≈{delta}):\n")
-            for opt in options[:10]:  # show top 10
-                print(f"{opt['type']:>4} {opt['symbol']} | "
-                      f"Strike: {opt['strike']} | Exp: {opt['expDate']} | "
-                      f"DTE: {opt['dte']} | Δ: {opt['delta']:.2f} | "
-                      f"Γ: {opt['gamma']:.3f} | Θ: {opt['theta']:.2f} | "
-                      f"V: {opt['vega']:.2f} | IV: {opt['iv']:.2f}")
+        filtered = filter_contracts(df, max_dte=max_dte, delta_min=delta_range[0], delta_max=delta_range[1])
+        if filtered.empty:
+            st.info(f"No contracts passed filters for {sym}")
+            continue
 
-            print("\n")
-
-        except Exception as e:
-            print(f"Error: {e}\n")
+        st.dataframe(filtered[["ticker", "expiration", "strike", "dte", "delta", "iv", "open_interest"]].head(20))
 
 
 if __name__ == "__main__":
